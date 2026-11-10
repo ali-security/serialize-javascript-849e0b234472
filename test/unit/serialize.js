@@ -131,6 +131,37 @@ describe('serialize( obj )', function () {
             expect(err).to.be.an.instanceOf(TypeError);
         });
 
+        it('should throw when serializing a function with a spoofed non-string toString()', function () {
+            var fn = function () {};
+            fn.toString = function () {
+                return {
+                    toString: function () { return 'function(){}'; }
+                };
+            };
+            expect(function () { serialize({ fn: fn }); }).to.throw(TypeError);
+        });
+
+        it('should throw when a spoofed toString() returns an object with its own replace()', function () {
+            // Without a type check, `escapeFunctionBody()` would call this
+            // object's `replace()`, which returns the payload unescaped.
+            var fn = function () {};
+            fn.toString = function () {
+                return {
+                    replace: function () { return this; },
+                    toString: function () {
+                        return 'function(){}</script><img src=x onerror=alert(1)>';
+                    }
+                };
+            };
+            expect(function () { serialize({ fn: fn }); }).to.throw(TypeError);
+        });
+
+        it('should escape script close tags from a spoofed string toString()', function () {
+            var fn = function () {};
+            fn.toString = function () { return 'function(){}</script>'; };
+            expect(serialize({ fn: fn }).indexOf('</script>')).to.equal(-1);
+        });
+
         it('should serialize enhanced literal objects', function () {
             var obj = {
                 foo() { return true; },
@@ -529,6 +560,208 @@ describe('serialize( obj )', function () {
             expect(eval(serialize('</script>'))).to.equal('</script>');
             expect(serialize(new URL('x:</script>'))).to.equal('new URL("x:\\u003C\\u002Fscript\\u003E")');
             expect(eval(serialize(new URL('x:</script>'))).href).to.equal('x:</script>');
+        });
+
+        it('should encode unsafe HTML chars in function bodies', function () {
+            function fn() { return '</script>'; }
+            var serialized = serialize(fn);
+            expect(serialized.includes('\\u003C\\u002Fscript\\u003E')).to.equal(true);
+            expect(serialized.includes('</script>')).to.equal(false);
+            // Verify the function still works after deserialization
+            var deserialized; eval('deserialized = ' + serialized);
+            expect(deserialized).to.be.a('function');
+            expect(deserialized()).to.equal('</script>');
+        });
+
+        // A `</script` only ends the script element when the next character
+        // is one the HTML tokenizer accepts as ending the tag name. Followed
+        // by anything else it is emitted as text, so that is what must be
+        // absent from the output -- not every literal `</script` substring.
+        var CLOSES_SCRIPT = /<\/script[\t\n\f\r \/>]/i;
+
+        it('should not leak a second script close tag swallowed by the first match (PSECBUGS-117112)', function () {
+            // `x</script=+/` parses as `x < /script=+/` (a comparison against
+            // a regex literal), so `</script` appears in plain-code position
+            // with no `>` after it until the one inside the later string. The
+            // first regex alternative used to match across that whole span in
+            // one go, emitting the inner `</script>` raw.
+            var src = "function f(x){ return x</script=+/ + '</script><img src=x onerror=alert(1)>' }";
+            var fn = new Function('return ' + src)();
+            var serialized = serialize({ h: fn });
+
+            expect(CLOSES_SCRIPT.test(serialized)).to.equal(false);
+            // The inner tag is inside a string literal, so it unicode-escapes.
+            expect(serialized.includes('\\u003C\\u002Fscript\\u003E')).to.equal(true);
+        });
+
+        it('should escape a script close tag at the very end of a function body (PSECBUGS-118415)', function () {
+            // Each body is escaped on its own, so one ending in a bare
+            // `</script` can't see the newline the `space` option emits right
+            // after it, and a later value can then supply the closing `>`.
+            var f = function () {};
+            f.toString = function () { return 'function f(){ return 1 }//</script'; };
+            var g = function () {};
+            g.toString = function () { return 'function g(x){ return x } > <img src=x onerror=alert(1)>'; };
+            var serialized = serialize({ a: { f: f }, g: g }, { space: 2 });
+
+            expect(CLOSES_SCRIPT.test(serialized)).to.equal(false);
+            // Inside the line comment, so it unicode-escapes.
+            expect(serialized.includes('//\\u003C\\u002Fscript\n')).to.equal(true);
+        });
+
+        it('should neutralize a script close tag ending a function body in code position', function () {
+            var fn = function () {};
+            fn.toString = function () { return 'function f(x){ return x }</script'; };
+            var serialized = serialize([fn], { space: 2 });
+
+            expect(CLOSES_SCRIPT.test(serialized)).to.equal(false);
+            expect(serialized.includes('}< /script\n')).to.equal(true);
+        });
+
+        it('should escape every script close tag when several appear in one function', function () {
+            var src = "function f(x){ return x</script=+/ + '</script>' + '</script>' + '</script >' }";
+            var fn = new Function('return ' + src)();
+            var serialized = serialize({ h: fn });
+
+            expect(CLOSES_SCRIPT.test(serialized)).to.equal(false);
+        });
+
+        it('should not let a script close tag straddle plain code and a string', function () {
+            // The `</script` in code position and the one in the string must
+            // be classified separately, since only the latter can safely be
+            // rewritten as unicode escapes.
+            var src = "function f(x){ return x</script/ + '</script>' }";
+            var fn = new Function('return ' + src)();
+            var serialized = serialize({ h: fn });
+
+            expect(CLOSES_SCRIPT.test(serialized)).to.equal(false);
+            // Code position: neutralized with a space, which parses the same.
+            expect(serialized.includes('< /script/')).to.equal(true);
+            // String position: unicode-escaped, preserving the runtime value.
+            expect(serialized.includes('\\u003C\\u002Fscript\\u003E')).to.equal(true);
+        });
+
+        it('should encode unsafe HTML chars in arrow function bodies', function () {
+            var fn = () => { return '</script>'; };
+            var serialized = serialize(fn);
+            expect(serialized.includes('\\u003C\\u002Fscript\\u003E')).to.equal(true);
+            expect(serialized.includes('</script>')).to.equal(false);
+            // Verify the function still works after deserialization
+            var deserialized; eval('deserialized = ' + serialized);
+            expect(deserialized).to.be.a('function');
+            expect(deserialized()).to.equal('</script>');
+        });
+
+        it('should encode unsafe HTML chars in enhanced literal object methods', function () {
+            var obj = {
+                fn() { return '</script>'; }
+            };
+            var serialized = serialize(obj);
+            expect(serialized.includes('\\u003C\\u002Fscript\\u003E')).to.equal(true);
+            expect(serialized.includes('</script>')).to.equal(false);
+            // Verify the function still works after deserialization
+            var deserialized; eval('deserialized = ' + serialized);
+            expect(deserialized.fn()).to.equal('</script>');
+        });
+
+        it('should not escape function bodies when unsafe option is true', function () {
+            function fn() { return '</script>'; }
+            var serialized = serialize(fn, {unsafe: true});
+            expect(serialized.includes('</script>')).to.equal(true);
+            expect(serialized.includes('\\u003C\\u002Fscript\\u003E')).to.equal(false);
+        });
+
+        it('should encode </script > with space before >', function () {
+            function fn() { return '</script >'; }
+            var serialized = serialize(fn);
+            expect(serialized.includes('\\u003C\\u002Fscript')).to.equal(true);
+            expect(serialized.includes('</script ')).to.equal(false);
+            // Verify the function still works after deserialization
+            var deserialized; eval('deserialized = ' + serialized);
+            expect(deserialized).to.be.a('function');
+            expect(deserialized()).to.equal('</script >');
+        });
+
+        it('should encode </script foo> with attributes', function () {
+            function fn() { return '</script foo>'; }
+            var serialized = serialize(fn);
+            expect(serialized.includes('\\u003C\\u002Fscript')).to.equal(true);
+            expect(serialized.includes('</script ')).to.equal(false);
+            // Verify the function still works after deserialization
+            var deserialized; eval('deserialized = ' + serialized);
+            expect(deserialized).to.be.a('function');
+            expect(deserialized()).to.equal('</script foo>');
+        });
+
+        it('should encode </script with tab before >', function () {
+            function fn() { return '</script\t>'; }
+            var serialized = serialize(fn);
+            expect(serialized.includes('\\u003C\\u002Fscript')).to.equal(true);
+            expect(serialized.includes('</script')).to.equal(false);
+            // Verify the function still works after deserialization
+            var deserialized; eval('deserialized = ' + serialized);
+            expect(deserialized).to.be.a('function');
+            expect(deserialized()).to.equal('</script\t>');
+        });
+
+        it('should encode split script-closing payload across function bodies', function () {
+            var serialized = serialize({
+                a: function () { /* </script */ },
+                b: function () { /* > <img src=x onerror=alert(1)> */ }
+            });
+
+            expect(serialized.includes('</script')).to.equal(false);
+            expect(serialized.includes('\\u003C\\u002Fscript')).to.equal(true);
+
+            var deserialized; eval('deserialized = ' + serialized);
+            expect(deserialized.a).to.be.a('function');
+            expect(deserialized.b).to.be.a('function');
+        });
+
+        it('should not corrupt `<` used as a comparison operator followed by a regex literal', function () {
+            // `</script` here is not an HTML closing tag: it's the token
+            // sequence `<` (less-than) followed by the regex literal
+            // `/script/`. Naively unicode-escaping `<` and `/` in this
+            // context produces invalid JavaScript syntax.
+            function fn(x) { return x</script/.test(x); }
+            var serialized = serialize(fn);
+
+            var deserialized;
+            eval('deserialized = ' + serialized); // must not throw a SyntaxError
+            expect(deserialized).to.be.a('function');
+            // Behavior must be identical to the original function.
+            expect(deserialized('script')).to.equal(fn('script'));
+            expect(deserialized('other')).to.equal(fn('other'));
+        });
+
+        it('should not let a quote inside a regex literal misalign a later string literal', function () {
+            // The quote in `/'/` must not be mistaken for the start of a
+            // string; otherwise the real string below is misidentified and
+            // its `</script ` payload is left unescaped as plain code.
+            function fn(x) { return /'/.test(x) ? '</script ' : 'ok'; }
+            var serialized = serialize(fn);
+
+            expect(/<\/script[\t\n\f\r \/>]/i.test(serialized)).to.equal(false);
+
+            var deserialized; eval('deserialized = ' + serialized);
+            expect(deserialized("'")).to.equal(fn("'"));
+            expect(deserialized('x')).to.equal(fn('x'));
+        });
+
+        it('should not let a `/` inside a regex character class end the regex literal early', function () {
+            // `/` inside `[...]` doesn't need to be escaped and doesn't
+            // terminate the regex literal. If it were mistaken for the
+            // closing delimiter, the real string literal that follows would
+            // be misidentified and its `</script ` payload left unescaped.
+            function fn(x) { return /[/']/.test(x) ? '</script ' : 'ok'; }
+            var serialized = serialize(fn);
+
+            expect(/<\/script[\t\n\f\r \/>]/i.test(serialized)).to.equal(false);
+
+            var deserialized; eval('deserialized = ' + serialized);
+            expect(deserialized("'")).to.equal(fn("'"));
+            expect(deserialized('/')).to.equal(fn('/'));
+            expect(deserialized('x')).to.equal(fn('x'));
         });
     });
 
